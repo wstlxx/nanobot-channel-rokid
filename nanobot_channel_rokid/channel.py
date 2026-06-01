@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 import websockets
+import websockets.exceptions
 from pydantic import Field
 
 from nanobot.channels.base import BaseChannel
@@ -17,11 +18,11 @@ logger = logging.getLogger(__name__)
 class RokidConfig(Base):
     """Rokid channel configuration."""
     enabled: bool = False
-    ws_url: str = "wss://..."  # 替换为真实的 Rokid WS Gateway URL
+    ws_url: str = "wss://rcs.rokid.com/claw/ws/link"
     link_code: str = ""
     link_secret: str = ""
     allow_from: list[str] = Field(default_factory=list)
-    streaming: bool = True     # 开启 nanobot 的流式输出支持
+    streaming: bool = True
 
 class RokidChannel(BaseChannel):
     name = "rokid"
@@ -63,8 +64,8 @@ class RokidChannel(BaseChannel):
                     reconnect_attempt = 0
                     logger.info("[rokid] Connected successfully.")
                     
-                    # 发送连接状态帧 (与 openclaw ws-bridge-service 对齐)
-                    await ws.send(json.dumps({"type": "status", "connected": True}))
+                    # 发送连接状态帧
+                    await self._send_ws_frame({"type": "status", "connected": True})
                     
                     # 持续监听消息
                     async for message in ws:
@@ -87,8 +88,11 @@ class RokidChannel(BaseChannel):
     async def stop(self) -> None:
         """干净地关闭"""
         self._running = False
-        if self.ws and not self.ws.closed:
-            await self.ws.close(code=1000, reason="Plugin stopping")
+        if self.ws:
+            try:
+                await self.ws.close(code=1000, reason="Plugin stopping")
+            except Exception:
+                pass
 
     async def _on_message(self, raw_message: str) -> None:
         """解析来自 Rokid 的消息并路由给 Nanobot Agent"""
@@ -99,7 +103,6 @@ class RokidChannel(BaseChannel):
             return
 
         if data.get("type") == "cancel":
-            # 暂不支持硬取消，nanobot 的 pipeline 会继续处理
             return
 
         # 兼容两种字段名 (messages/requestId 或 message/message_id)
@@ -121,70 +124,75 @@ class RokidChannel(BaseChannel):
 
         combined_text = "\n".join(text_parts)
         
-        # 将消息发布到 Agent 总线
-        # 我们使用 request_id 作为 chat_id，确保回复能对应回这条请求
         await self._handle_message(
             sender_id=self.config.link_code, 
             chat_id=request_id,
             content=combined_text,
-            media=media_urls  # 注意：如果 nanobot agent 无法直接处理 URL media，你可能需要在这里下载为本地路径
+            media=media_urls 
         )
 
-    # ==========================================
-    # 下行消息处理 (Agent -> Rokid)
-    # ==========================================
-
     async def _send_ws_frame(self, frame: dict) -> None:
-        if self.ws and not self.ws.closed:
+        """安全地发送 WebSocket 帧"""
+        if not self.ws:
+            logger.warning("[rokid] Cannot send message, WebSocket is not initialized.")
+            return
+            
+        try:
             await self.ws.send(json.dumps(frame))
-        else:
-            logger.warning("[rokid] Cannot send message, WebSocket is not connected.")
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("[rokid] Cannot send message, WebSocket connection is closed.")
+        except Exception as e:
+            logger.error(f"[rokid] Error sending message: {e}")
 
     async def send(self, msg: OutboundMessage) -> None:
         """一次性发送（如果未开启流式）"""
-        # 如果截获到了设备工具调用格式（见下方说明），则发送 tool_call 帧
-        if await self._handle_device_tool_intercept(msg):
+        if await self._handle_device_tool_intercept(msg.chat_id, msg.content):
             return
 
+        # 检查是否还有后续消息（比如调用工具后）
+        is_resuming = msg.metadata.get("_resuming", False)
+
         await self._send_ws_frame({
-            "event": "done",
+            "event": "done" if not is_resuming else "message",
             "data": {
                 "role": "agent",
                 "message_id": msg.chat_id,
                 "agent_id": "nanobot",
                 "answer_stream": msg.content,
-                "is_finish": True,
+                "is_finish": not is_resuming,  # 如果还要继续，就告诉 Rokid 不要结束
                 "type": "answer"
             }
         })
 
-    async def send_delta(self, msg: OutboundMessage) -> None:
-        """流式输出，逐块发送给设备，对应 sendStreamChunk 和 sendDone"""
-        if await self._handle_device_tool_intercept(msg):
+    async def send_delta(self, chat_id: str, content: str, metadata: dict) -> None:
+        """流式输出，逐块发送给设备"""
+        if await self._handle_device_tool_intercept(chat_id, content):
             return
 
-        delta = getattr(msg, "delta", "")
-        stream_end = getattr(msg, "_stream_end", False)
+        stream_end = metadata.get("_stream_end", False)
+        # 检查多步逻辑中是否还会继续
+        is_resuming = metadata.get("_resuming", False)
 
-        if delta:
+        if content:
             await self._send_ws_frame({
                 "event": "message",
                 "data": {
                     "role": "agent",
-                    "message_id": msg.chat_id,
+                    "message_id": chat_id,
                     "agent_id": "nanobot",
-                    "answer_stream": delta,
+                    "answer_stream": content,
                     "is_finish": False,
                     "type": "answer"
                 }
             })
 
-        if stream_end:
+        # 只有在流结束，且明确没有后续工具调用的情况下，才正式通知 Rokid 关断通道
+        if stream_end and not is_resuming:
             await self._send_ws_frame({
                 "event": "done",
                 "data": {
                     "role": "agent",
-                    "message_id": msg.chat_id,
+                    "message_id": chat_id,
                     "agent_id": "nanobot",
                     "answer_stream": "",
                     "is_finish": True,
@@ -192,26 +200,21 @@ class RokidChannel(BaseChannel):
                 }
             })
 
-    async def _handle_device_tool_intercept(self, msg: OutboundMessage) -> bool:
-        """
-        拦截设备指令：
-        Nanobot 和 Openclaw 处理工具的逻辑不同。Openclaw 在网关层注册了工具并截获。
-        在 Nanobot 中，你可以让 Agent 遇到需要调用设备功能时，输出特定的 JSON 或 XML 格式（例如 {"command": "take_photo"}）
-        这个方法检测到这类特殊文本后，将其转换为设备期望的 tool_call 帧并吞掉该文本。
-        """
-        if not msg.content.strip():
+    async def _handle_device_tool_intercept(self, chat_id: str, content: str) -> bool:
+        """拦截设备指令（如拍照、导航等 JSON 命令）"""
+        if not content or not content.strip():
             return False
             
         try:
-            # 这是一个简单的启发式检测：如果输出是纯 JSON 且包含 command 字段
-            if msg.content.strip().startswith("{") and msg.content.strip().endswith("}"):
-                data = json.loads(msg.content)
+            text = content.strip()
+            if text.startswith("{") and text.endswith("}"):
+                data = json.loads(text)
                 if "command" in data:
                     await self._send_ws_frame({
                         "event": "done",
                         "data": {
                             "role": "agent",
-                            "message_id": msg.chat_id,
+                            "message_id": chat_id,
                             "agent_id": "nanobot",
                             "is_finish": True,
                             "type": "tool_call",
